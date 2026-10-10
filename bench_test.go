@@ -230,12 +230,21 @@ const (
 )
 
 // fixSweepLimiter 构造一个「已填充 n 个 IP、每个 IP sweepRecordsPerIP 条记录、
-// 且下一次 allow 必然触发回收」的限流器。
+// 且下一次 allow 必然触发回收的限流器。
 // 填充走限流器正常入口（allowAt），每个 IP 调用 sweepLimit 次，因此每个 IP 恰好
-// 记录 10 条（t == base），并在 base+2min 触发回收时全部过期（window=1min，
+// 记录 10 条（t == base），并在 [base+2min] 触发回收时全部过期（window=1min，
 // cutoff = base+1min，10 条均早于 cutoff）。
 //
-// 填充工作不计入任何计时区间：调用方需在 StopTimer 状态下调用它。
+// 返回值中 l.sweepEvery 已置 0，只要传入的触发时刻**不早于** l.lastSweep
+// （= 本函数内部 newRateLimiter 时的 time.Now()），下一次 allow 就会触发 sweepLocked。
+// 因此调用方必须把触发时刻算成本轮填充的时刻（base）再加偏移，不能拿到循环外
+// 复用同一个绝对时刻：那会随着真实时间前进使触发时刻反而早于 l.lastSweep，
+// 此时 now.Sub(lastSweep) 为负、sweepEvery=0 也满足不了条件，回收会**静默不触发**，
+// 基准就变成了在测一条空的拒绝路径。
+//
+// 填充成本是否计入计时区间**由调用方决定**：
+//   - BenchmarkLimiterSweep 在 StopTimer 状态下调用以排除填充成本；
+//   - BenchmarkLimiterSweepWithFill 则在计时区间内调用，有意把填充计入。
 func fixSweepLimiter(n int, base time.Time) *rateLimiter {
 	ips := makeIPs(n)
 	l := newRateLimiter()
@@ -266,14 +275,18 @@ func fixSweepLimiter(n int, base time.Time) *rateLimiter {
 // StopTimer/StartTimer 排除在计时区间之外；报告中的 ns/op、B/op、allocs/op
 // 只反映 sweepLocked 及其触发它的那一次 allow 调用本身，可解释为「单次 sweep
 // 的成本」，**不含**填充成本。
+//
+// **触发时刻每轮重算**：base 与 next 都在循环内、相对于本轮填充时刻计算。
+// 若把 base 提到循环外，长时间运行后 next 会早于新一轮限流器的 lastSweep
+// （= newRateLimiter 时的真实 now），now.Sub(lastSweep) 为负 → 回收不触发。
 func BenchmarkLimiterSweep(b *testing.B) {
-	base := time.Now()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
+		base := time.Now()
 		l := fixSweepLimiter(sweepIPCount, base)
-		next := base.Add(2 * time.Minute)
+		next := base.Add(2 * time.Minute) // 相对本轮填充时刻，保证晚于 l.lastSweep
 		b.StartTimer()
 
 		l.allowAt("192.168.0.1", sweepLimit, next) // 触发 sweepLocked
@@ -286,11 +299,13 @@ func BenchmarkLimiterSweep(b *testing.B) {
 // **计时范围**：与 BenchmarkLimiterSweep 相反，它**有意把填充成本计入**被测区间，
 // 因此其结果**不能**当作纯回收耗时解释；保留它是为了观察「填充 + 回收」整体开销
 // 随规模的变化。
+//
+// 触发时刻同样每轮重算（见 BenchmarkLimiterSweep 的说明），避免长跑后回收不触发。
 func BenchmarkLimiterSweepWithFill(b *testing.B) {
-	base := time.Now()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		base := time.Now()
 		l := fixSweepLimiter(sweepIPCount, base)
 		next := base.Add(2 * time.Minute)
 		l.allowAt("192.168.0.1", sweepLimit, next)
@@ -365,4 +380,37 @@ func TestSweepFixtureRecordsAllExpired(t *testing.T) {
 		t.Fatalf("回收后应只剩新 IP（1 个），实际 %d", got)
 	}
 	t.Logf("回收夹具：64 个 IP × %d 条记录全部过期，一次 sweep 后仅剩新 IP", sweepRecordsPerIP)
+}
+
+// TestSweepTriggersWithStaleBase 守护触发时刻的算法：base 取一个**远早于现在**的
+// 时刻（模拟基准长跑很久之后，循环外的固定 base 已经过期），触发时刻相对 base
+// 计算就会早于新一轮限流器的 lastSweep（= newRateLimiter 时的真实 now），
+// now.Sub(lastSweep) 为负 → 即便 sweepEvery=0 也**不会**触发回收。
+// 基准必须按此每轮重算触发时刻；本测试把该陷阱固定下来。
+func TestSweepTriggersWithStaleBase(t *testing.T) {
+	staleBase := time.Now().Add(-10 * time.Minute)
+	l := fixSweepLimiter(64, staleBase)
+
+	staleNext := staleBase.Add(2 * time.Minute) // 已早于真实 now
+	if !staleNext.Before(l.lastSweep) {
+		t.Fatal("前置条件不成立：staleNext 应早于 l.lastSweep")
+	}
+
+	if !l.allowAt("192.168.0.1", sweepLimit, staleNext) {
+		t.Fatal("新 IP 应放行")
+	}
+	if got := len(l.entries); got != 65 {
+		t.Fatalf("陈旧触发时刻下回收不应发生（应保留 64 个旧 IP + 1 个新 IP = 65），实际 %d", got)
+	}
+
+	// 相对本轮填充时刻重算后，回收必须发生。
+	l2 := fixSweepLimiter(64, staleBase)
+	freshNext := time.Now().Add(2 * time.Minute)
+	if !l2.allowAt("192.168.0.1", sweepLimit, freshNext) {
+		t.Fatal("新 IP 应放行")
+	}
+	if got := len(l2.entries); got != 1 {
+		t.Fatalf("相对当前时刻的触发应完成回收（仅剩 1 个新 IP），实际 %d", got)
+	}
+	t.Log("已确认：触发时刻必须每轮相对 newRateLimiter 的真实时刻重算，否则回收静默不触发")
 }
