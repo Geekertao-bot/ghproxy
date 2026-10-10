@@ -221,53 +221,79 @@ func BenchmarkLimiterNewRealClock_ManyIPs(b *testing.B) {
 	benchNewRealClock(b, benchIPsMany, benchLimit)
 }
 
-// fixSweepLimiter 构造一个「已填充 n 个 IP、且下一次 allow 必然触发回收」的限流器：
-// 每个 IP 通过 allowAt(ip, 10, base) 写入 10 条记录。
+// sweepRecordsPerIP 是回收基准中每个 IP 的记录条数：经公开入口写入 10 条
+// （sweepLimit 恰好为 10，故 10 次调用全部放行、全部被记录）。
+const (
+	sweepLimit        int64 = 10
+	sweepRecordsPerIP       = 10
+	sweepIPCount            = 5000
+)
+
+// fixSweepLimiter 构造一个「已填充 n 个 IP、每个 IP sweepRecordsPerIP 条记录、
+// 且下一次 allow 必然触发回收」的限流器。
+// 填充走限流器正常入口（allowAt），每个 IP 调用 sweepLimit 次，因此每个 IP 恰好
+// 记录 10 条（t == base），并在 base+2min 触发回收时全部过期（window=1min，
+// cutoff = base+1min，10 条均早于 cutoff）。
+//
 // 填充工作不计入任何计时区间：调用方需在 StopTimer 状态下调用它。
 func fixSweepLimiter(n int, base time.Time) *rateLimiter {
 	ips := makeIPs(n)
 	l := newRateLimiter()
 	l.sweepEvery = time.Hour // 填充期间不触发回收
 	for _, ip := range ips {
-		l.allowAt(ip, 10, base)
+		for j := 0; j < sweepRecordsPerIP; j++ {
+			if !l.allowAt(ip, sweepLimit, base) {
+				panic("回收基准填充失败：sweepLimit 次以内不应被拒绝")
+			}
+		}
+	}
+	// 防注释与代码脱节：每个 IP 必须恰好 sweepRecordsPerIP 条记录。
+	for _, ip := range ips {
+		if got := len(l.entries[ip]); got != sweepRecordsPerIP {
+			panic(fmt.Sprintf("回收基准填充记录数 = %d，期望 %d", got, sweepRecordsPerIP))
+		}
 	}
 	l.sweepEvery = 0 // 下一次 allow 立即触发 sweepLocked
 	return l
 }
 
-// BenchmarkLimiterSweep 只衡量**一次回收操作**本身（5000 个 IP、每个 10 条记录，
-// 全部已过期 → 全部删除）。
+// BenchmarkLimiterSweep 只衡量**一次回收操作**本身。
 //
-// 构造限流器与填充 5000 个 IP 属于初始化成本，通过 StopTimer/StartTimer 排除在
-// 计时区间之外；报告中的 ns/op、B/op、allocs/op 只反映 sweepLocked 及其触发它的
-// 那一次 allow 调用本身，可以解释为「单次 sweep 的成本」。
+// 工作负载：sweepIPCount(5000) 个 IP × sweepRecordsPerIP(10) 条记录 = 50,000 条，
+// 全部已在窗口外过期 → 一次 sweepLocked 应把 5000 个 IP 键全部删除。
+//
+// **计时范围**：构造限流器与填充 5000 个 IP 属于初始化成本，通过
+// StopTimer/StartTimer 排除在计时区间之外；报告中的 ns/op、B/op、allocs/op
+// 只反映 sweepLocked 及其触发它的那一次 allow 调用本身，可解释为「单次 sweep
+// 的成本」，**不含**填充成本。
 func BenchmarkLimiterSweep(b *testing.B) {
-	const n = 5000
 	base := time.Now()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		l := fixSweepLimiter(n, base)
+		l := fixSweepLimiter(sweepIPCount, base)
 		next := base.Add(2 * time.Minute)
 		b.StartTimer()
 
-		l.allowAt("192.168.0.1", 10, next) // 触发 sweepLocked
+		l.allowAt("192.168.0.1", sweepLimit, next) // 触发 sweepLocked
 	}
 }
 
 // BenchmarkLimiterSweepWithFill 衡量**完整周期**：新建限流器 + 填充 5000 个 IP
-// + 触发一次回收。它包含初始化与数据填充成本，因此**不能**当作纯回收耗时解释；
-// 保留它是为了观察「填充 + 回收」整体开销随规模的变化。
+// （每个 10 条记录）+ 触发一次回收。
+//
+// **计时范围**：与 BenchmarkLimiterSweep 相反，它**有意把填充成本计入**被测区间，
+// 因此其结果**不能**当作纯回收耗时解释；保留它是为了观察「填充 + 回收」整体开销
+// 随规模的变化。
 func BenchmarkLimiterSweepWithFill(b *testing.B) {
-	const n = 5000
 	base := time.Now()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		l := fixSweepLimiter(n, base)
+		l := fixSweepLimiter(sweepIPCount, base)
 		next := base.Add(2 * time.Minute)
-		l.allowAt("192.168.0.1", 10, next)
+		l.allowAt("192.168.0.1", sweepLimit, next)
 	}
 }
 
@@ -304,4 +330,39 @@ func TestBenchmarkPrimeStates(t *testing.T) {
 
 	t.Logf("饱和态记录数：新实现 %d / 旧实现 %d（limit=%d，相差 1 即本 PR 修正的边界偏差）",
 		expectedNewRejectingRecords(limit), expectedOldRejectingRecords(limit), limit)
+}
+
+// TestSweepFixtureRecordsAllExpired 断言回收基准的填充夹具与注释一致：
+// 每个 IP 恰好 sweepRecordsPerIP 条记录，且在触发回收的时刻全部已过期
+// （这才是「一次 sweep 删除 5000 个 IP 键」的前提）。
+func TestSweepFixtureRecordsAllExpired(t *testing.T) {
+	base := time.Now()
+	l := fixSweepLimiter(64, base) // 用小规模验证夹具本身
+
+	if got := len(l.entries); got != 64 {
+		t.Fatalf("填充后 IP 数 = %d，期望 64", got)
+	}
+	for ip, times := range l.entries {
+		if len(times) != sweepRecordsPerIP {
+			t.Fatalf("IP %s 记录数 = %d，期望 %d", ip, len(times), sweepRecordsPerIP)
+		}
+	}
+
+	next := base.Add(2 * time.Minute)
+	cutoff := next.Add(-l.window)
+	for ip, times := range l.entries {
+		for i, ts := range times {
+			if !ts.Before(cutoff) {
+				t.Fatalf("IP %s 第 %d 条记录 %v 未早于 cutoff %v，回收时不会过期", ip, i, ts, cutoff)
+			}
+		}
+	}
+
+	if !l.allowAt("192.168.0.1", sweepLimit, next) {
+		t.Fatal("新 IP 应放行")
+	}
+	if got := len(l.entries); got != 1 {
+		t.Fatalf("回收后应只剩新 IP（1 个），实际 %d", got)
+	}
+	t.Logf("回收夹具：64 个 IP × %d 条记录全部过期，一次 sweep 后仅剩新 IP", sweepRecordsPerIP)
 }
