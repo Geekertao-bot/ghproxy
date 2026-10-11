@@ -400,10 +400,14 @@ func proxy(c *gin.Context, u string, cfg *Config) {
 	// 仅当目标是 api.github.com、正文是合法 JSON、message 符合已知限流文案且
 	// 其中的地址通过 IPv4 校验时，才把那个地址换成占位符，其余正文原样保留。
 	// 注意：只有没有 Location 时才缓冲正文，以免干扰重定向分支。
+	// 主机取自**最终响应**对应的请求：http.Client 默认跟随重定向，最终响应可能来自
+	// 另一个主机；此时不能拿最初请求的主机做判断。主机信息缺失时失败关闭（不脱敏）。
 	var redactedBody, bufferedBody []byte
 	redacted := false
 	if resp.Header.Get("Location") == "" {
-		redactedBody, bufferedBody, redacted = redactGitHubRateLimit(resp, req.URL.Host)
+		if host, ok := finalResponseHost(resp); ok {
+			redactedBody, bufferedBody, redacted = redactGitHubRateLimit(resp, host)
+		}
 	}
 
 	for key, values := range resp.Header {
@@ -540,6 +544,25 @@ const (
 // rateLimitIPExp 匹配紧跟在限流文案前缀后的点分十进制 IPv4（不含末尾句点，
 // 句点必须原样保留给客户端）。
 var rateLimitIPExp = regexp.MustCompile(`^([0-9]{1,3}(?:\.[0-9]{1,3}){3})`)
+
+// finalResponseHost 返回**最终响应**所对应请求的主机。
+//
+// 为什么不能直接用最初请求的主机（曾用 req.URL.Host）：http.Client 默认跟随
+// 重定向，最终响应可能来自另一个主机；若拿初始主机判断，就等于“初始是
+// api.github.com 就脱敏”，而正文实际来自别处，判断依据不成立。
+//
+// 任何环节缺失（resp / resp.Request / resp.Request.URL 为空，或 Host 为空）都
+// 返回 ok=false —— 失败关闭：不脱敏、按原有逻辑转发。刻意**不**回退到初始主机。
+func finalResponseHost(resp *http.Response) (string, bool) {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return "", false
+	}
+	host := resp.Request.URL.Host
+	if host == "" {
+		return "", false
+	}
+	return host, true
+}
 
 // isGitHubAPIHost 判断上游主机是否为 GitHub API。
 // 仅对 api.github.com 生效：raw / codeload / 自建镜像等主机即使返回相似文案

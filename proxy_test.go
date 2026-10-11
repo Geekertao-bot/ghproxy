@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -428,5 +431,340 @@ func TestRedactRateLimitMessage(t *testing.T) {
 		if changed && got != tc.want {
 			t.Fatalf("输入 %q：\n got %q\nwant %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 最终响应主机判断：http.Client 默认跟随重定向，最终响应可能来自另一个主机，
+// 因此脱敏必须依据 resp.Request.URL.Host，而不是最初请求的主机。
+// 信息缺失时失败关闭（不脱敏、不 panic），且不得回退到初始主机。
+// ---------------------------------------------------------------------------
+
+// finalReq 描述伪上游响应携带的「最终请求」形态。
+type finalReq struct {
+	host  string // resp.Request.URL.Host
+	noReq bool   // resp.Request = nil
+	noURL bool   // resp.Request.URL = nil
+}
+
+// withFakeUpstreamFinal 让 proxy() 收到的上游响应携带指定的最终请求信息。
+func withFakeUpstreamFinal(t *testing.T, resp *http.Response, f finalReq) {
+	t.Helper()
+	old := httpClient
+	httpClient = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case f.noReq:
+				resp.Request = nil
+			case f.noURL:
+				fr := r.Clone(r.Context())
+				fr.URL = nil
+				resp.Request = fr
+			default:
+				u, err := url.Parse("https://" + f.host + "/x")
+				if err != nil {
+					t.Fatalf("构造最终请求 URL 失败: %v", err)
+				}
+				fr := r.Clone(r.Context())
+				fr.URL = u
+				resp.Request = fr
+			}
+			return resp, nil
+		}),
+		// 阻止自动跟随，便于直接构造最终的 resp.Request。
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	t.Cleanup(func() { httpClient = old })
+}
+
+// 最终响应来自 api.github.com 时，仍执行精准替换。
+func TestProxyRedactsWhenFinalHostIsGitHubAPI(t *testing.T) {
+	setTestGinMode(t)
+	body := &trackingBody{r: strings.NewReader(redactTestBody)}
+	resp := &http.Response{StatusCode: http.StatusForbidden, Header: jsonTestHeader(len(redactTestBody)), Body: body, ContentLength: int64(len(redactTestBody))}
+	// 初始请求指向别处，最终响应却来自 api.github.com。
+	withFakeUpstreamFinal(t, resp, finalReq{host: "api.github.com"})
+
+	c, w := newTestContext(http.MethodGet, "/https://ghproxy.example/https://api.github.com/repos/a/b")
+	proxy(c, "https://ghproxy.example/https://api.github.com/repos/a/b", config.Load())
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("状态码应为 403，实际 %d", w.Code)
+	}
+	if got := w.Body.String(); got != redactTestExpected {
+		t.Fatalf("最终主机为 api.github.com 时应替换：\n got %q\nwant %q", got, redactTestExpected)
+	}
+	if !body.closed {
+		t.Fatal("上游响应体未被关闭")
+	}
+}
+
+// 初始请求指向 api.github.com，但经重定向后最终响应来自其他主机：
+// 即使正文完全匹配，也不得脱敏（判断依据必须是最终主机）。
+func TestProxyDoesNotRedactWhenFinalHostDiffers(t *testing.T) {
+	for _, host := range []string{"cdn.example.com", "raw.githubusercontent.com", "github.com", "evil.example.net:8443"} {
+		t.Run(host, func(t *testing.T) {
+			setTestGinMode(t)
+			body := &trackingBody{r: strings.NewReader(redactTestBody)}
+			resp := &http.Response{StatusCode: http.StatusForbidden, Header: jsonTestHeader(len(redactTestBody)), Body: body, ContentLength: int64(len(redactTestBody))}
+			withFakeUpstreamFinal(t, resp, finalReq{host: host})
+
+			c, w := newTestContext(http.MethodGet, "/"+redactTestAPITarget)
+			proxy(c, redactTestAPITarget, config.Load()) // 初始请求是 api.github.com
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("状态码应为 403，实际 %d", w.Code)
+			}
+			if got := w.Body.String(); got != redactTestBody {
+				t.Fatalf("最终主机为 %s 时不得脱敏，实际 %q", host, got)
+			}
+			if !body.closed {
+				t.Fatal("上游响应体未被关闭")
+			}
+		})
+	}
+}
+
+// resp.Request / resp.Request.URL / Host 缺失时：不 panic，也不脱敏（失败关闭）。
+func TestProxyFailsClosedWhenFinalRequestInfoMissing(t *testing.T) {
+	cases := []struct {
+		name string
+		f    finalReq
+	}{
+		{"nil-request", finalReq{noReq: true}},
+		{"nil-url", finalReq{noURL: true}},
+		{"empty-host", finalReq{host: ""}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestGinMode(t)
+			body := &trackingBody{r: strings.NewReader(redactTestBody)}
+			resp := &http.Response{StatusCode: http.StatusForbidden, Header: jsonTestHeader(len(redactTestBody)), Body: body, ContentLength: int64(len(redactTestBody))}
+			withFakeUpstreamFinal(t, resp, tc.f)
+
+			c, w := newTestContext(http.MethodGet, "/"+redactTestAPITarget)
+			// 即使初始请求是 api.github.com，也不能据此脱敏。
+			proxy(c, redactTestAPITarget, config.Load())
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("状态码应为 403，实际 %d", w.Code)
+			}
+			if got := w.Body.String(); got != redactTestBody {
+				t.Fatalf("最终主机未知时应原样转发，实际 %q", got)
+			}
+			if !body.closed {
+				t.Fatal("上游响应体未被关闭")
+			}
+		})
+	}
+}
+
+// finalResponseHost 单测：只有三个环节都齐备且 Host 非空才返回 ok。
+func TestFinalResponseHost(t *testing.T) {
+	mk := func(u string, nilURL bool) *http.Request {
+		r := &http.Request{}
+		if !nilURL {
+			parsed, err := url.Parse(u)
+			if err != nil {
+				t.Fatalf("URL 解析失败: %v", err)
+			}
+			r.URL = parsed
+		}
+		return r
+	}
+	cases := []struct {
+		name   string
+		resp   *http.Response
+		wantOK bool
+		want   string
+	}{
+		{"nil-response", nil, false, ""},
+		{"nil-request", &http.Response{}, false, ""},
+		{"nil-url", &http.Response{Request: mk("", true)}, false, ""},
+		{"empty-host", &http.Response{Request: mk("https:///x", false)}, false, ""},
+		{"with-port", &http.Response{Request: mk("https://api.github.com:443/x", false)}, true, "api.github.com:443"},
+		{"mixed-case", &http.Response{Request: mk("https://API.GitHub.com/x", false)}, true, "API.GitHub.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := finalResponseHost(tc.resp)
+			if ok != tc.wantOK || got != tc.want {
+				t.Fatalf("finalResponseHost = (%q, %v)，期望 (%q, %v)", got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+	// 端口与大小写归一化仍由 isGitHubAPIHost 负责。
+	for _, h := range []string{"api.github.com", "API.GitHub.com", "api.github.com:443", "api.github.com:80"} {
+		if !isGitHubAPIHost(h) {
+			t.Fatalf("isGitHubAPIHost(%q) 应为 true", h)
+		}
+	}
+	for _, h := range []string{"api.github.com.evil.example", "notapi.github.com", "raw.githubusercontent.com", ""} {
+		if isGitHubAPIHost(h) {
+			t.Fatalf("isGitHubAPIHost(%q) 应为 false", h)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 边界 A：Content-Encoding: gzip
+// 压缩正文不能直接做字符串/JSON 替换；应整体原样转发（字节级不变），
+// 状态码与相关响应头保持一致，上游响应体正确关闭。
+// ---------------------------------------------------------------------------
+
+func TestProxyLeavesGzipBodyUnmodified(t *testing.T) {
+	setTestGinMode(t)
+
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(redactTestBody)); err != nil {
+		t.Fatalf("gzip 写入失败: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip 关闭失败: %v", err)
+	}
+	gz := buf.Bytes()
+	if len(gz) == 0 {
+		t.Fatal("gzip 产物为空")
+	}
+
+	h := http.Header{}
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	h.Set("Content-Encoding", "gzip")
+	h.Set("Content-Length", strconv.Itoa(len(gz)))
+	h.Set("X-RateLimit-Remaining", "0")
+
+	body := &trackingBody{r: bytes.NewReader(gz)}
+	resp := &http.Response{StatusCode: http.StatusForbidden, Header: h, Body: body, ContentLength: int64(len(gz))}
+	withFakeTransport(t, resp, body)
+
+	c, w := newTestContext(http.MethodGet, "/"+redactTestAPITarget)
+	proxy(c, redactTestAPITarget, config.Load())
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("状态码应保持 403，实际 %d", w.Code)
+	}
+	got := w.Body.Bytes()
+	// 压缩字节必须逐字节不变（未做任何字符串/JSON 替换）。
+	if !bytes.Equal(got, gz) {
+		t.Fatalf("压缩正文被改动：got %d 字节，want %d 字节", len(got), len(gz))
+	}
+	if w.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("Content-Encoding 应保留，实际 %q", w.Header().Get("Content-Encoding"))
+	}
+	if cl := w.Header().Get("Content-Length"); cl != strconv.Itoa(len(gz)) {
+		t.Fatalf("Content-Length 应保持压缩后长度 %d，实际 %q", len(gz), cl)
+	}
+	if w.Header().Get("X-RateLimit-Remaining") != "0" {
+		t.Fatalf("上游头部应透传，实际 %q", w.Header().Get("X-RateLimit-Remaining"))
+	}
+	// 解压回来仍应是「含出口 IP 的原文」——证明既没破坏压缩流，也没尝试改写。
+	zr, err := gzip.NewReader(bytes.NewReader(got))
+	if err != nil {
+		t.Fatalf("产物不再是合法 gzip: %v", err)
+	}
+	plain, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("解压失败: %v", err)
+	}
+	if string(plain) != redactTestBody {
+		t.Fatalf("解压后应与原文一致：\n got %q\nwant %q", string(plain), redactTestBody)
+	}
+	if !strings.Contains(string(plain), redactTestIP) {
+		t.Fatal("gzip 正文不应被脱敏")
+	}
+	if !body.closed {
+		t.Fatal("上游响应体未被关闭")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 边界 B：超过 maxRedactBodyBytes 的正文
+// 两种情况都不得脱敏、必须完整转发（前缀不丢、后续不截断），body 正确关闭。
+//   B1: Content-Length 已知且超限 → 直接不缓冲。
+//   B2: 长度未知 → 需读入前缀判定后回退到「先写缓冲、再流式复制」路径。
+// ---------------------------------------------------------------------------
+
+func oversizePayload(fill byte) string {
+	n := maxRedactBodyBytes + 64*1024
+	return redactTestBody + strings.Repeat(string(fill), n-len(redactTestBody))
+}
+
+func TestProxyLeavesOversizeBodyUnmodified_ContentLengthKnown(t *testing.T) {
+	setTestGinMode(t)
+	payload := oversizePayload('x')
+	if len(payload) <= maxRedactBodyBytes {
+		t.Fatalf("测试数据未超过上限：%d", len(payload))
+	}
+
+	body := &trackingBody{r: strings.NewReader(payload)}
+	resp := &http.Response{
+		StatusCode:    http.StatusForbidden,
+		Header:        jsonTestHeader(len(payload)),
+		Body:          body,
+		ContentLength: int64(len(payload)),
+	}
+	withFakeTransport(t, resp, body)
+
+	c, w := newTestContext(http.MethodGet, "/"+redactTestAPITarget)
+	proxy(c, redactTestAPITarget, config.Load())
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("状态码应保持 403，实际 %d", w.Code)
+	}
+	if w.Body.Len() != len(payload) {
+		t.Fatalf("超限正文必须完整转发：got %d 字节，want %d", w.Body.Len(), len(payload))
+	}
+	if got := w.Body.String(); got != payload {
+		t.Fatal("超限正文内容不符（前缀丢失或被截断）")
+	}
+	if !strings.Contains(w.Body.String(), redactTestIP) {
+		t.Fatal("超限正文不应被脱敏")
+	}
+	if cl := w.Header().Get("Content-Length"); cl != strconv.Itoa(len(payload)) {
+		t.Fatalf("Content-Length 应保持原值 %d，实际 %q", len(payload), cl)
+	}
+	if !body.closed {
+		t.Fatal("上游响应体未被关闭")
+	}
+}
+
+func TestProxyLeavesOversizeBodyUnmodified_ContentLengthUnknown(t *testing.T) {
+	setTestGinMode(t)
+	payload := oversizePayload('y')
+
+	// 不设置 Content-Length 头部，且 ContentLength = -1（长度未知）。
+	h := http.Header{}
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	h.Set("X-RateLimit-Remaining", "0")
+
+	body := &trackingBody{r: strings.NewReader(payload)}
+	resp := &http.Response{
+		StatusCode:    http.StatusForbidden,
+		Header:        h,
+		Body:          body,
+		ContentLength: -1,
+	}
+	withFakeTransport(t, resp, body)
+
+	c, w := newTestContext(http.MethodGet, "/"+redactTestAPITarget)
+	proxy(c, redactTestAPITarget, config.Load())
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("状态码应保持 403，实际 %d", w.Code)
+	}
+	// 关键：读入的前缀必须写回，且后续内容不得被截断或重复。
+	got := w.Body.String()
+	if len(got) != len(payload) {
+		t.Fatalf("正文长度不符（前缀丢失或内容截断/重复）：got %d，want %d", len(got), len(payload))
+	}
+	if got != payload {
+		t.Fatal("正文内容与上游不一致")
+	}
+	if !strings.Contains(got, redactTestIP) {
+		t.Fatal("超限正文不应被脱敏")
+	}
+	if !body.closed {
+		t.Fatal("上游响应体未被关闭")
 	}
 }
