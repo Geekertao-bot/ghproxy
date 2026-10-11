@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -394,22 +395,27 @@ func proxy(c *gin.Context, u string, cfg *Config) {
 		return
 	}
 
-	// 上游的限流/拒绝响应体可能包含本服务自身的出口 IP 等基础设施信息，
-	// 例如 GitHub API 的：
-	//   403 {"message":"API rate limit exceeded for 198.98.52.152. ..."}
-	// 原样转发等于把这个 IP 暴露给任何调用者。因此 403 / 429 一律不转发上游
-	// 响应体（也不转发上游其它头部），改为固定文案；只保留描述配额与等待时长
-	// 的退避头部（它们不含任何地址信息）。
-	if hidesUpstreamBody(resp.StatusCode) {
-		copyBackoffHeaders(c, resp.Header)
-		c.String(resp.StatusCode, upstreamLimitedBody)
-		return
+	// 上游 403 / 429 的正文可能带着本服务的出口 IP（GitHub API 限流文案里就
+	// 直接写着 "API rate limit exceeded for <ip>"）。这里只做**精准替换**：
+	// 仅当目标是 api.github.com、正文是合法 JSON、message 符合已知限流文案且
+	// 其中的地址通过 IPv4 校验时，才把那个地址换成占位符，其余正文原样保留。
+	// 注意：只有没有 Location 时才缓冲正文，以免干扰重定向分支。
+	var redactedBody, bufferedBody []byte
+	redacted := false
+	if resp.Header.Get("Location") == "" {
+		redactedBody, bufferedBody, redacted = redactGitHubRateLimit(resp, req.URL.Host)
 	}
 
 	for key, values := range resp.Header {
+		if redacted && strings.EqualFold(key, "Content-Length") {
+			continue // 正文已改写，上游的长度不能再沿用
+		}
 		for _, value := range values {
 			c.Header(key, value)
 		}
+	}
+	if redacted {
+		c.Writer.Header().Del("Content-Length")
 	}
 
 	if location := resp.Header.Get("Location"); location != "" {
@@ -424,6 +430,18 @@ func proxy(c *gin.Context, u string, cfg *Config) {
 	}
 
 	c.Status(resp.StatusCode)
+	if redacted {
+		if _, err := c.Writer.Write(redactedBody); err != nil {
+			return
+		}
+		return
+	}
+	if len(bufferedBody) > 0 {
+		// 为了判断能否改写而读入内存的前缀必须写回，否则会丢数据。
+		if _, err := c.Writer.Write(bufferedBody); err != nil {
+			return
+		}
+	}
 	if _, err := io.Copy(c.Writer, resp.Body); err != nil {
 		return
 	}
@@ -494,40 +512,168 @@ func checkList(matches, list []string) bool {
 	return false
 }
 
-// upstreamLimitedBody 是上游 403 / 429 响应被替换后的固定文案。
-// 目的：不把上游错误体转发给客户端——GitHub 的限流文案里直接写着本服务的
-// 出口 IP（"API rate limit exceeded for <ip>"），那是基础设施信息，不该外泄。
-const upstreamLimitedBody = "Upstream request rejected (rate limit or forbidden). Please try again later."
-
-// hidesUpstreamBody 判断该上游状态码的响应体是否必须对客户端隐藏。
+// ---------------------------------------------------------------------------
+// 出口 IP 脱敏（精准替换，不重写整段错误正文）
 //
-// 为什么是 403 / 429：这两种状态是上游错误体带出本服务出口 IP 的典型场合
-// （已实测：GitHub API 主限流返回 403，体里有 "API rate limit exceeded for
-// 198.98.52.152"，同时带 x-ratelimit-remaining: 0）。次限流还会用 429 +
-// Retry-After。按状态码判定可以覆盖未知文案形态，比匹配字符串稳妥。
-// 其余状态码维持原样转发，避免改变 API 客户端的既有语义。
-func hidesUpstreamBody(status int) bool {
-	return status == http.StatusForbidden || status == http.StatusTooManyRequests
+// 生产实测：GitHub API 匿名配额耗尽时返回
+//   403 {"message":"API rate limit exceeded for 198.98.52.152. (But here's the
+//         good news: Authenticated requests get a higher rate limit. ...)",
+//         "documentation_url":"https://docs.github.com/..."}
+// 其中的地址是**本代理服务器的出口 IP**，原样转发会把它暴露给任何访问者。
+//
+// 处理方式：只对「发往 api.github.com 且状态码为 403 / 429」的响应，把 message
+// 字段里紧跟在 rateLimitMessagePrefix 之后、且通过 IPv4 校验的地址替换为
+// proxyServerPlaceholder；其余字段（含 documentation_url）、提示文字与状态码
+// 全部保留。任何条件不满足都按原样转发，绝不输出半改的 JSON。
+// ---------------------------------------------------------------------------
+
+const (
+	// rateLimitMessagePrefix 是 GitHub 限流文案中紧接出口 IP 的前缀。
+	rateLimitMessagePrefix = "API rate limit exceeded for "
+	// proxyServerPlaceholder 是替换出口 IP 后的写法，句子其余部分保持不变。
+	proxyServerPlaceholder = "this proxy Server"
+	// maxRedactBodyBytes 是允许缓冲以执行脱敏的正文上限；超过则原样转发，
+	// 避免为了改几个字节把大响应体读进内存。
+	maxRedactBodyBytes = 1 << 20 // 1 MiB
+)
+
+// rateLimitIPExp 匹配紧跟在限流文案前缀后的点分十进制 IPv4（不含末尾句点，
+// 句点必须原样保留给客户端）。
+var rateLimitIPExp = regexp.MustCompile(`^([0-9]{1,3}(?:\.[0-9]{1,3}){3})`)
+
+// isGitHubAPIHost 判断上游主机是否为 GitHub API。
+// 仅对 api.github.com 生效：raw / codeload / 自建镜像等主机即使返回相似文案
+// 也不做替换（它们不该出现本服务的出口 IP，且改动面越小越安全）。
+func isGitHubAPIHost(host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return strings.EqualFold(host, "api.github.com")
 }
 
-// backoffHeaders 是隐藏响应体时仍值得留给客户端的头部：它们只描述配额与
-// 等待时长，不含地址信息。
-var backoffHeaders = []string{
-	"Retry-After",
-	"X-RateLimit-Limit",
-	"X-RateLimit-Remaining",
-	"X-RateLimit-Reset",
-	"X-RateLimit-Used",
-	"X-RateLimit-Resource",
-}
-
-// copyBackoffHeaders 只转发退避相关头部，避免顺带转发上游其它头部。
-func copyBackoffHeaders(c *gin.Context, h http.Header) {
-	for _, key := range backoffHeaders {
-		if v := h.Get(key); v != "" {
-			c.Header(key, v)
+// validIPv4 校验点分十进制 IPv4：四段、各段 0-255、拒绝前导零（非标准写法
+// 一律不认，宁可回退到原样转发）。
+func validIPv4(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) == 0 || len(p) > 3 {
+			return false
+		}
+		if len(p) > 1 && p[0] == '0' {
+			return false
+		}
+		n := 0
+		for i := 0; i < len(p); i++ {
+			if p[i] < '0' || p[i] > '9' {
+				return false
+			}
+			n = n*10 + int(p[i]-'0')
+		}
+		if n > 255 {
+			return false
 		}
 	}
+	return true
+}
+
+// redactRateLimitMessage 只改写 message 字符串里目标位置的 IP。
+// 返回 (改写后的文案, 是否改写)。
+func redactRateLimitMessage(msg string) (string, bool) {
+	if !strings.HasPrefix(msg, rateLimitMessagePrefix) {
+		return "", false
+	}
+	rest := msg[len(rateLimitMessagePrefix):]
+	m := rateLimitIPExp.FindStringSubmatchIndex(rest)
+	if m == nil {
+		return "", false
+	}
+	ip := rest[m[2]:m[3]]
+	// 地址后必须是句点（已知文案格式）；句点本身保留。
+	if !validIPv4(ip) || m[3] >= len(rest) || rest[m[3]] != '.' {
+		return "", false
+	}
+	return rateLimitMessagePrefix + proxyServerPlaceholder + rest[m[3]:], true
+}
+
+// redactRateLimitBody 在**不破坏 JSON 结构**的前提下替换 message 中的出口 IP：
+// 先按 JSON 对象解析并取出 message 的原始字节，再在原正文里只替换这一处，
+// 其余键值（含 documentation_url）按字节原样保留。
+// 返回 (新正文, 是否成功改写)。
+func redactRateLimitBody(raw []byte) ([]byte, bool) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, false // 不是有效的 JSON 对象
+	}
+	rawMsg, ok := fields["message"]
+	if !ok {
+		return nil, false
+	}
+	var msg string
+	if err := json.Unmarshal(rawMsg, &msg); err != nil {
+		return nil, false // message 不是字符串
+	}
+	newMsg, changed := redactRateLimitMessage(msg)
+	if !changed {
+		return nil, false
+	}
+
+	// 用 SetEscapeHTML(false) 编码，避免顺手把 message 里的字符转义成 \u003c 之类。
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(newMsg); err != nil {
+		return nil, false
+	}
+	newRawMsg := bytes.TrimRight(buf.Bytes(), "\n")
+
+	// 定位 message 值的原始字节：找不到、或出现多次（无法确定改的是哪个字段）
+	// 就放弃，回退到原样转发。
+	idx := bytes.Index(raw, rawMsg)
+	if idx < 0 || bytes.Index(raw[idx+len(rawMsg):], rawMsg) >= 0 {
+		return nil, false
+	}
+	out := make([]byte, 0, len(raw)+len(newRawMsg)-len(rawMsg))
+	out = append(out, raw[:idx]...)
+	out = append(out, newRawMsg...)
+	out = append(out, raw[idx+len(rawMsg):]...)
+	return out, true
+}
+
+// redactGitHubRateLimit 是脱敏入口。返回约定：
+//   - redacted != nil  → 已改写，调用方应改用它作为正文；
+//   - buffered != nil  → 未改写，但已把正文（前缀）读入内存，调用方必须先写
+//     buffered 再继续从 resp.Body 复制，否则会丢数据；
+//   - 都为 nil（且 ok=false）→ 完全没碰正文，按原有流程流式转发。
+func redactGitHubRateLimit(resp *http.Response, host string) (redacted, buffered []byte, ok bool) {
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
+		return nil, nil, false
+	}
+	if !isGitHubAPIHost(host) {
+		return nil, nil, false
+	}
+	// 压缩正文不能直接改字节（Content-Encoding 与长度都得跟着变），保持原样。
+	if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+		return nil, nil, false
+	}
+	if n := resp.ContentLength; n > maxRedactBodyBytes {
+		return nil, nil, false
+	}
+
+	// 允许长度未知（Go 对 gzip 做透明解压时会清掉 Content-Length）。
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxRedactBodyBytes+1))
+	if err != nil {
+		return nil, raw, false // 读取出错：已读部分不能丢
+	}
+	if len(raw) > maxRedactBodyBytes {
+		return nil, raw, false
+	}
+	if body, changed := redactRateLimitBody(raw); changed {
+		return body, nil, true
+	}
+	return nil, raw, false
 }
 
 func render404(c *gin.Context, tmpl *template.Template, cfg *Config) {
