@@ -394,6 +394,18 @@ func proxy(c *gin.Context, u string, cfg *Config) {
 		return
 	}
 
+	// 上游的限流/拒绝响应体可能包含本服务自身的出口 IP 等基础设施信息，
+	// 例如 GitHub API 的：
+	//   403 {"message":"API rate limit exceeded for 198.98.52.152. ..."}
+	// 原样转发等于把这个 IP 暴露给任何调用者。因此 403 / 429 一律不转发上游
+	// 响应体（也不转发上游其它头部），改为固定文案；只保留描述配额与等待时长
+	// 的退避头部（它们不含任何地址信息）。
+	if hidesUpstreamBody(resp.StatusCode) {
+		copyBackoffHeaders(c, resp.Header)
+		c.String(resp.StatusCode, upstreamLimitedBody)
+		return
+	}
+
 	for key, values := range resp.Header {
 		for _, value := range values {
 			c.Header(key, value)
@@ -480,6 +492,42 @@ func checkList(matches, list []string) bool {
 		}
 	}
 	return false
+}
+
+// upstreamLimitedBody 是上游 403 / 429 响应被替换后的固定文案。
+// 目的：不把上游错误体转发给客户端——GitHub 的限流文案里直接写着本服务的
+// 出口 IP（"API rate limit exceeded for <ip>"），那是基础设施信息，不该外泄。
+const upstreamLimitedBody = "Upstream request rejected (rate limit or forbidden). Please try again later."
+
+// hidesUpstreamBody 判断该上游状态码的响应体是否必须对客户端隐藏。
+//
+// 为什么是 403 / 429：这两种状态是上游错误体带出本服务出口 IP 的典型场合
+// （已实测：GitHub API 主限流返回 403，体里有 "API rate limit exceeded for
+// 198.98.52.152"，同时带 x-ratelimit-remaining: 0）。次限流还会用 429 +
+// Retry-After。按状态码判定可以覆盖未知文案形态，比匹配字符串稳妥。
+// 其余状态码维持原样转发，避免改变 API 客户端的既有语义。
+func hidesUpstreamBody(status int) bool {
+	return status == http.StatusForbidden || status == http.StatusTooManyRequests
+}
+
+// backoffHeaders 是隐藏响应体时仍值得留给客户端的头部：它们只描述配额与
+// 等待时长，不含地址信息。
+var backoffHeaders = []string{
+	"Retry-After",
+	"X-RateLimit-Limit",
+	"X-RateLimit-Remaining",
+	"X-RateLimit-Reset",
+	"X-RateLimit-Used",
+	"X-RateLimit-Resource",
+}
+
+// copyBackoffHeaders 只转发退避相关头部，避免顺带转发上游其它头部。
+func copyBackoffHeaders(c *gin.Context, h http.Header) {
+	for _, key := range backoffHeaders {
+		if v := h.Get(key); v != "" {
+			c.Header(key, v)
+		}
+	}
 }
 
 func render404(c *gin.Context, tmpl *template.Template, cfg *Config) {

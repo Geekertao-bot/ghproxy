@@ -157,3 +157,113 @@ func TestHandlerReturns429WhenLimited(t *testing.T) {
 		t.Fatalf("应返回 429，实际 %d", w.Code)
 	}
 }
+
+// 上游限流响应体里带有本服务的出口 IP（实测 GitHub API 文案：
+// "API rate limit exceeded for 198.98.52.152."），不应原样转发给客户端。
+func TestProxyHidesUpstreamRateLimitBody(t *testing.T) {
+	setTestGinMode(t)
+	// 用文档保留地址 TEST-NET-2（198.51.100.0/24）代替真实出口 IP。
+	const leaked = `{"message":"API rate limit exceeded for 198.51.100.7. (But here's the good news: ...)","documentation_url":"https://docs.github.com/..."}`
+	body := &trackingBody{r: strings.NewReader(leaked)}
+	// 用 http.Header 的 Set 构造：Go 会把键规范化为 X-Ratelimit-*（不是
+	// 字面上的 X-RateLimit-*），手写 map 字面量会因键不规范化而查不到。
+	h := http.Header{}
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	h.Set("Content-Length", strconv.Itoa(len(leaked)))
+	h.Set("X-RateLimit-Limit", "60")
+	h.Set("X-RateLimit-Remaining", "0")
+	h.Set("X-RateLimit-Reset", "1791699455")
+	h.Set("Retry-After", "42")
+	resp := &http.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     h,
+		Body:       body,
+	}
+	withFakeTransport(t, resp, body)
+
+	c, w := newTestContext(http.MethodGet, "/https://api.github.com/repos/a/b")
+	proxy(c, "https://api.github.com/repos/a/b", config.Load())
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("状态码应保持 403，实际 %d", w.Code)
+	}
+	got := w.Body.String()
+	if strings.Contains(got, "198.51.100.7") {
+		t.Fatalf("上游出口 IP 被转发给客户端：%q", got)
+	}
+	if got != upstreamLimitedBody {
+		t.Fatalf("响应体应为固定文案 %q，实际 %q", upstreamLimitedBody, got)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("应使用固定文案的 Content-Type，实际 %q", ct)
+	}
+	// 退避头部需保留（不含地址信息，对客户端有用）。
+	if w.Header().Get("Retry-After") != "42" {
+		t.Fatalf("Retry-After 应保留，实际 %q", w.Header().Get("Retry-After"))
+	}
+	if w.Header().Get("X-RateLimit-Remaining") != "0" {
+		t.Fatalf("X-RateLimit-Remaining 应保留，实际 %q", w.Header().Get("X-RateLimit-Remaining"))
+	}
+	if w.Header().Get("X-RateLimit-Reset") != "1791699455" {
+		t.Fatalf("X-RateLimit-Reset 应保留，实际 %q", w.Header().Get("X-RateLimit-Reset"))
+	}
+	// 上游的 Content-Length 描述的是被替换掉的正文，不能再转发。
+	if cl := w.Header().Get("Content-Length"); cl != "" && cl != strconv.Itoa(w.Body.Len()) {
+		t.Fatalf("Content-Length 与实际正文不一致：%q vs %d", cl, w.Body.Len())
+	}
+	if !body.closed {
+		t.Fatal("上游响应体未被关闭")
+	}
+}
+
+// 次限流使用 429 + Retry-After，同样不应转发上游响应体。
+func TestProxyHidesUpstream429Body(t *testing.T) {
+	setTestGinMode(t)
+	const leaked = `{"message":"You have exceeded a secondary rate limit. Please wait a few minutes. (198.51.100.7)"}`
+	body := &trackingBody{r: strings.NewReader(leaked)}
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header: http.Header{
+			"Content-Type": []string{"application/json; charset=utf-8"},
+			"Retry-After":  []string{"60"},
+		},
+		Body: body,
+	}
+	withFakeTransport(t, resp, body)
+
+	c, w := newTestContext(http.MethodGet, "/https://github.com/a/b/releases/download/v1/x.zip")
+	proxy(c, "https://github.com/a/b/releases/download/v1/x.zip", config.Load())
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("状态码应保持 429，实际 %d", w.Code)
+	}
+	if w.Body.String() != upstreamLimitedBody {
+		t.Fatalf("响应体应为固定文案，实际 %q", w.Body.String())
+	}
+	if !body.closed {
+		t.Fatal("上游响应体未被关闭")
+	}
+}
+
+// 其余状态码维持原样转发，避免改变 API 客户端的既有语义。
+func TestProxyStillForwardsNonLimitedErrorBodies(t *testing.T) {
+	setTestGinMode(t)
+	const payload = `{"message":"Not Found"}`
+	body := &trackingBody{r: strings.NewReader(payload)}
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Header:     http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
+		Body:       body,
+	}
+	withFakeTransport(t, resp, body)
+
+	c, w := newTestContext(http.MethodGet, "/https://api.github.com/repos/a/b")
+	proxy(c, "https://api.github.com/repos/a/b", config.Load())
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("状态码应为 401，实际 %d", w.Code)
+	}
+	if w.Body.String() != payload {
+		t.Fatalf("401 响应体应原样转发，实际 %q", w.Body.String())
+	}
+}
