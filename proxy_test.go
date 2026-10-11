@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -608,11 +611,17 @@ func TestFinalResponseHost(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // 边界 A：Content-Encoding: gzip
-// 压缩正文不能直接做字符串/JSON 替换；应整体原样转发（字节级不变），
-// 状态码与相关响应头保持一致，上游响应体正确关闭。
+//
+// 客户端带 Accept-Encoding 时，上游限流错误体会是 gzip 压缩的；而压缩字节无法
+// 直接做 JSON 替换 —— 旧实现因此跳过脱敏，出口 IP 继续泄露。现在两条路都堵上：
+//   A1. 请求侧对 api.github.com 放弃编码协商 → Transport 透明解压（真实 Transport 测试）；
+//   A2. 万一仍带 Content-Encoding: gzip → 在大小上限内解压、精准替换、再重新压缩。
 // ---------------------------------------------------------------------------
 
-func TestProxyLeavesGzipBodyUnmodified(t *testing.T) {
+// A2：伪 transport 直接给出 gzip 正文（模拟 Transport 未透明解压的路径）。
+// 断言最终正文解压后含 "this proxy Server"、不含测试 IP，且压缩流有效、头部与
+// 关闭行为合理。
+func TestProxyRedactsGzipBody(t *testing.T) {
 	setTestGinMode(t)
 
 	var buf bytes.Buffer
@@ -623,19 +632,242 @@ func TestProxyLeavesGzipBodyUnmodified(t *testing.T) {
 	if err := zw.Close(); err != nil {
 		t.Fatalf("gzip 关闭失败: %v", err)
 	}
-	gz := buf.Bytes()
-	if len(gz) == 0 {
-		t.Fatal("gzip 产物为空")
+	comp := buf.Bytes()
+
+	h := http.Header{}
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	h.Set("Content-Encoding", "gzip")
+	h.Set("Content-Length", strconv.Itoa(len(comp)))
+	h.Set("X-RateLimit-Remaining", "0")
+
+	body := &trackingBody{r: bytes.NewReader(comp)}
+	resp := &http.Response{StatusCode: http.StatusForbidden, Header: h, Body: body, ContentLength: int64(len(comp))}
+	withFakeTransport(t, resp, body)
+
+	c, w := newTestContext(http.MethodGet, "/"+redactTestAPITarget)
+	proxy(c, redactTestAPITarget, config.Load())
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("状态码应保持 403，实际 %d", w.Code)
+	}
+	if enc := w.Header().Get("Content-Encoding"); !strings.EqualFold(enc, "gzip") {
+		t.Fatalf("重新压缩后 Content-Encoding 应仍为 gzip，实际 %q", enc)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "json") {
+		t.Fatalf("Content-Type 应保持 JSON，实际 %q", ct)
+	}
+	// Content-Length 必须与新（重新压缩后的）正文一致，或干脆不下发。
+	if cl := w.Header().Get("Content-Length"); cl != "" && cl != strconv.Itoa(w.Body.Len()) {
+		t.Fatalf("Content-Length 与实际正文不符：头部 %q，正文 %d 字节", cl, w.Body.Len())
+	}
+
+	got := w.Body.Bytes()
+	if len(got) == 0 {
+		t.Fatal("正文为空")
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(got))
+	if err != nil {
+		t.Fatalf("返回的正文不是合法 gzip 流: %v", err)
+	}
+	plain, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("解压失败（压缩流可能被破坏）: %v", err)
+	}
+	if err := zr.Close(); err != nil {
+		t.Fatalf("gzip 流关闭失败: %v", err)
+	}
+	decoded := string(plain)
+	if !strings.Contains(decoded, "this proxy Server") {
+		t.Fatalf("解压后应含占位符：%q", decoded)
+	}
+	if strings.Contains(decoded, redactTestIP) {
+		t.Fatalf("解压后仍含测试 IP：%q", decoded)
+	}
+	if !strings.Contains(decoded, redactTestDocURL) {
+		t.Fatalf("documentation_url 应保留：%q", decoded)
+	}
+	// 解压后应等于「原文被精准替换」的结果（其余字符逐字节一致）。
+	if decoded != redactTestExpected {
+		t.Fatalf("解压结果不符：\n got %q\nwant %q", decoded, redactTestExpected)
+	}
+	if w.Header().Get("X-RateLimit-Remaining") != "0" {
+		t.Fatalf("上游其它头部应透传，实际 %q", w.Header().Get("X-RateLimit-Remaining"))
+	}
+	if !body.closed {
+		t.Fatal("上游响应体未被关闭")
+	}
+}
+
+// A1：真实 http.Transport 行为 —— 请求侧放弃编码协商后，Go 会自行加
+// Accept-Encoding: gzip 并透明解压，正文以明文到达，精准脱敏得以执行。
+// 用自定义 DialContext 把 api.github.com 的连接指向本地测试服务器，
+// 因此既不访问外网，又走的是真实 Transport 路径。
+func TestProxyRedactsGzipBodyWithRealTransport(t *testing.T) {
+	setTestGinMode(t)
+
+	var (
+		seenAcceptEncoding []string
+		seenPaths          []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAcceptEncoding = append(seenAcceptEncoding, r.Header.Get("Accept-Encoding"))
+		seenPaths = append(seenPaths, r.URL.Path)
+		// 上游无论客户端怎么协商都返回 gzip 压缩的限流错误体。
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusForbidden)
+		zw := gzip.NewWriter(w)
+		_, _ = zw.Write([]byte(redactTestBody))
+		_ = zw.Close()
+	}))
+	defer srv.Close()
+
+	srvURL, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("解析测试服务器地址失败: %v", err)
+	}
+
+	origClient := httpClient
+	httpClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, srvURL.Host) // 一律指到测试服务器
+			},
+		},
+	}
+	t.Cleanup(func() { httpClient = origClient })
+
+	// 模拟浏览器：客户端声明多种编码。我们只对 api.github.com 放弃协商，
+	// 因此上游只应看到 Transport 自己协商的 gzip，而不是客户端的列表。
+	const clientAE = "br, deflate, gzip"
+
+	// 目标主机必须是 api.github.com，这样才会走「放弃编码协商」的分支。
+	const target = "http://api.github.com/repos/a/b"
+	c, w := newTestContext(http.MethodGet, "/"+target)
+	c.Request.Header.Set("Accept-Encoding", clientAE)
+	proxy(c, target, config.Load())
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("状态码应为 403，实际 %d", w.Code)
+	}
+	if len(seenAcceptEncoding) != 1 {
+		t.Fatalf("测试服务器应收到 1 次请求，实际 %d", len(seenAcceptEncoding))
+	}
+	// 关键 1：上游不应看到客户端声明的编码列表；只应看到 Transport 的 gzip。
+	if got := seenAcceptEncoding[0]; got != "gzip" {
+		t.Fatalf("发给 api.github.com 的上游应只带 Transport 协商的 gzip（不得携带客户端列表 %q），实际 %q", clientAE, got)
+	}
+	// 关键 2：透明解压后，客户端拿到的应是明文 JSON（不再有 Content-Encoding）。
+	if enc := w.Header().Get("Content-Encoding"); enc != "" {
+		t.Fatalf("透明解压后不应再下发 Content-Encoding，实际 %q", enc)
+	}
+	got := w.Body.String()
+	if !strings.Contains(got, "this proxy Server") {
+		t.Fatalf("客户端正文应含占位符（说明已透明解压并完成精准替换）：%q", got)
+	}
+	if strings.Contains(got, redactTestIP) {
+		t.Fatalf("客户端正文不应含出口 IP：%q", got)
+	}
+	if !strings.Contains(got, redactTestDocURL) {
+		t.Fatalf("documentation_url 应保留：%q", got)
+	}
+	// 正文必须仍是合法 JSON（透明解压 + 精准替换后未被破坏）。
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(got), &decoded); err != nil {
+		t.Fatalf("正文不是合法 JSON: %v（%q）", err, got)
+	}
+	if msg, _ := decoded["message"].(string); msg != "API rate limit exceeded for this proxy Server."+redactTestSuffix {
+		t.Fatalf("message 字段不符：%q", decoded["message"])
+	}
+	if doc, _ := decoded["documentation_url"].(string); doc != redactTestDocURL {
+		t.Fatalf("documentation_url 字段不符：%q", decoded["documentation_url"])
+	}
+
+	// 关键 3（对照）：非 api.github.com 的上游必须保持原有编码协商，
+	// 客户端列表照常转发（否则会改变 raw / 大文件流式转发的行为）。
+	seenAcceptEncoding = nil
+	const otherTarget = "http://cdn.example.com/repos/a/b"
+	c2, w2 := newTestContext(http.MethodGet, "/"+otherTarget)
+	c2.Request.Header.Set("Accept-Encoding", clientAE)
+	proxy(c2, otherTarget, config.Load())
+
+	if len(seenAcceptEncoding) != 1 {
+		t.Fatalf("对照请求应到达测试服务器，实际 %d 次", len(seenAcceptEncoding))
+	}
+	if got := seenAcceptEncoding[0]; got != clientAE {
+		t.Fatalf("非 api.github.com 上游应原样转发客户端编码协商：got %q，want %q", got, clientAE)
+	}
+	// 客户端声明的编码被转发时，Transport 不做透明解压 → 正文仍是 gzip。
+	if enc := w2.Header().Get("Content-Encoding"); !strings.EqualFold(enc, "gzip") {
+		t.Fatalf("对照响应应保持 gzip（说明未透明解压），实际 Content-Encoding=%q", enc)
+	}
+	if w2.Code != http.StatusForbidden {
+		t.Fatalf("对照响应状态码应为 403，实际 %d", w2.Code)
+	}
+}
+
+// 兜底分支：无法安全解码的编码（如 br）必须原样转发，不做替换、不改字节。
+// 对 api.github.com 而言这条分支在正常路径上不可达（请求侧已放弃协商），
+// 保留它是为了「宁可原样转发，也不输出损坏的正文」。
+func TestProxyLeavesUnknownEncodedBodyUnmodified(t *testing.T) {
+	setTestGinMode(t)
+
+	// 用一段「像 brotli 但其实是任意字节」的正文，验证代码不会去碰它。
+	raw := []byte("not-really-brotli " + redactTestBody)
+
+	h := http.Header{}
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	h.Set("Content-Encoding", "br")
+	h.Set("Content-Length", strconv.Itoa(len(raw)))
+
+	body := &trackingBody{r: bytes.NewReader(raw)}
+	resp := &http.Response{StatusCode: http.StatusForbidden, Header: h, Body: body, ContentLength: int64(len(raw))}
+	withFakeTransport(t, resp, body)
+
+	c, w := newTestContext(http.MethodGet, "/"+redactTestAPITarget)
+	proxy(c, redactTestAPITarget, config.Load())
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("状态码应保持 403，实际 %d", w.Code)
+	}
+	if got := w.Body.Bytes(); !bytes.Equal(got, raw) {
+		t.Fatalf("无法解码的编码必须原样转发：got %d 字节，want %d", len(got), len(raw))
+	}
+	if enc := w.Header().Get("Content-Encoding"); enc != "br" {
+		t.Fatalf("Content-Encoding 应保留，实际 %q", enc)
+	}
+	if !body.closed {
+		t.Fatal("上游响应体未被关闭")
+	}
+}
+
+// 解压后超过 maxRedactBodyBytes（含 gzip 炸弹）→ 不解压、不脱敏，压缩字节原样转发。
+func TestProxyLeavesOversizeGzipBodyUnmodified(t *testing.T) {
+	setTestGinMode(t)
+
+	huge := redactTestBody + strings.Repeat("z", maxRedactBodyBytes+64*1024)
+
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(huge)); err != nil {
+		t.Fatalf("gzip 写入失败: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip 关闭失败: %v", err)
+	}
+	comp := buf.Bytes()
+	if len(comp) > maxRedactBodyBytes {
+		t.Fatalf("夹具不合预期：压缩后 %d 字节，应远小于上限", len(comp))
 	}
 
 	h := http.Header{}
 	h.Set("Content-Type", "application/json; charset=utf-8")
 	h.Set("Content-Encoding", "gzip")
-	h.Set("Content-Length", strconv.Itoa(len(gz)))
-	h.Set("X-RateLimit-Remaining", "0")
+	h.Set("Content-Length", strconv.Itoa(len(comp)))
 
-	body := &trackingBody{r: bytes.NewReader(gz)}
-	resp := &http.Response{StatusCode: http.StatusForbidden, Header: h, Body: body, ContentLength: int64(len(gz))}
+	body := &trackingBody{r: bytes.NewReader(comp)}
+	resp := &http.Response{StatusCode: http.StatusForbidden, Header: h, Body: body, ContentLength: int64(len(comp))}
 	withFakeTransport(t, resp, body)
 
 	c, w := newTestContext(http.MethodGet, "/"+redactTestAPITarget)
@@ -645,33 +877,20 @@ func TestProxyLeavesGzipBodyUnmodified(t *testing.T) {
 		t.Fatalf("状态码应保持 403，实际 %d", w.Code)
 	}
 	got := w.Body.Bytes()
-	// 压缩字节必须逐字节不变（未做任何字符串/JSON 替换）。
-	if !bytes.Equal(got, gz) {
-		t.Fatalf("压缩正文被改动：got %d 字节，want %d 字节", len(got), len(gz))
+	// 超限时不解压、不脱敏：压缩字节必须逐字节不变（不丢、不重、不截断）。
+	if !bytes.Equal(got, comp) {
+		t.Fatalf("超限 gzip 正文应原样转发：got %d 字节，want %d", len(got), len(comp))
 	}
-	if w.Header().Get("Content-Encoding") != "gzip" {
-		t.Fatalf("Content-Encoding 应保留，实际 %q", w.Header().Get("Content-Encoding"))
-	}
-	if cl := w.Header().Get("Content-Length"); cl != strconv.Itoa(len(gz)) {
-		t.Fatalf("Content-Length 应保持压缩后长度 %d，实际 %q", len(gz), cl)
-	}
-	if w.Header().Get("X-RateLimit-Remaining") != "0" {
-		t.Fatalf("上游头部应透传，实际 %q", w.Header().Get("X-RateLimit-Remaining"))
-	}
-	// 解压回来仍应是「含出口 IP 的原文」——证明既没破坏压缩流，也没尝试改写。
 	zr, err := gzip.NewReader(bytes.NewReader(got))
 	if err != nil {
-		t.Fatalf("产物不再是合法 gzip: %v", err)
+		t.Fatalf("原样转发的压缩流应仍合法: %v", err)
 	}
 	plain, err := io.ReadAll(zr)
 	if err != nil {
 		t.Fatalf("解压失败: %v", err)
 	}
-	if string(plain) != redactTestBody {
-		t.Fatalf("解压后应与原文一致：\n got %q\nwant %q", string(plain), redactTestBody)
-	}
-	if !strings.Contains(string(plain), redactTestIP) {
-		t.Fatal("gzip 正文不应被脱敏")
+	if len(plain) != len(huge) {
+		t.Fatalf("解压后长度不符：got %d，want %d", len(plain), len(huge))
 	}
 	if !body.closed {
 		t.Fatal("上游响应体未被关闭")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -356,6 +357,16 @@ func proxy(c *gin.Context, u string, cfg *Config) {
 		}
 	}
 	req.Header.Del("Host")
+	// 对发往 GitHub API 的请求放弃客户端的内容编码协商。
+	//
+	// 原因：客户端（浏览器、带 --compressed 的 curl 等）常带 Accept-Encoding，
+	// 该头会被原样转发给上游，于是限流错误体可能是 gzip 压缩的；而压缩字节
+	// 无法做 JSON 精准替换，出口 IP 就会继续漏出去。去掉该头后由 Transport
+	// 自行加 Accept-Encoding: gzip 并**透明解压**，正文始终是明文。
+	// 其余上游（raw / codeload / 资产直链 / 大文件）保持原样转发，流式行为不变。
+	if isGitHubAPIHost(req.URL.Host) {
+		req.Header.Del("Accept-Encoding")
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -677,9 +688,16 @@ func redactGitHubRateLimit(resp *http.Response, host string) (redacted, buffered
 	if !isGitHubAPIHost(host) {
 		return nil, nil, false
 	}
-	// 压缩正文不能直接改字节（Content-Encoding 与长度都得跟着变），保持原样。
-	if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
-		return nil, nil, false
+	// 仍带 Content-Encoding 的正文不能直接做字符串替换。
+	//  - gzip：在正文大小上限内安全解压 → 走同一套精准替换 → 重新压缩；
+	//  - 其它（br / zstd / 多值等）：无法在无新依赖的前提下安全解码，保持原样转发。
+	// 注意：对 api.github.com 已在请求侧放弃编码协商（见 proxy），Transport 会透明
+	// 解压并移除该头，因此正常情况下走不到这里；这段是兜底，不是必经路径。
+	if enc := strings.TrimSpace(resp.Header.Get("Content-Encoding")); enc != "" && !strings.EqualFold(enc, "identity") {
+		if !strings.EqualFold(enc, "gzip") {
+			return nil, nil, false
+		}
+		return redactGzipBody(resp)
 	}
 	if n := resp.ContentLength; n > maxRedactBodyBytes {
 		return nil, nil, false
@@ -697,6 +715,53 @@ func redactGitHubRateLimit(resp *http.Response, host string) (redacted, buffered
 		return body, nil, true
 	}
 	return nil, raw, false
+}
+
+// redactGzipBody 在正文大小上限内解压 gzip、执行同一套精准替换，再重新压缩。
+//
+// 边界的处理原则：任何一步不满足（超限、解压失败、文案不匹配）都回退到
+// “已读字节原样写回 + 继续流式复制”，绝不丢字节、不重复、不截断。
+// 解压侧用 LimitReader 限住**解压后**大小（防 gzip 炸弹），压缩侧限住**压缩后**
+// 大小（防大响应体被整个缓冲）。
+func redactGzipBody(resp *http.Response) (redacted, buffered []byte, ok bool) {
+	if n := resp.ContentLength; n > maxRedactBodyBytes {
+		return nil, nil, false
+	}
+	comp, err := io.ReadAll(io.LimitReader(resp.Body, maxRedactBodyBytes+1))
+	if err != nil {
+		return nil, comp, false // 读取出错：已读部分不能丢
+	}
+	if len(comp) > maxRedactBodyBytes {
+		return nil, comp, false // 压缩后已超限：不缓冲，原样转发
+	}
+
+	zr, err := gzip.NewReader(bytes.NewReader(comp))
+	if err != nil {
+		return nil, comp, false // 不是合法 gzip：原样转发
+	}
+	defer func() { _ = zr.Close() }()
+	plain, err := io.ReadAll(io.LimitReader(zr, maxRedactBodyBytes+1))
+	if err != nil {
+		return nil, comp, false
+	}
+	if len(plain) > maxRedactBodyBytes {
+		return nil, comp, false // 解压后超限（含 zip bomb）：原样转发
+	}
+
+	newPlain, changed := redactRateLimitBody(plain)
+	if !changed {
+		return nil, comp, false
+	}
+
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(newPlain); err != nil {
+		return nil, comp, false
+	}
+	if err := zw.Close(); err != nil {
+		return nil, comp, false
+	}
+	return buf.Bytes(), nil, true
 }
 
 func render404(c *gin.Context, tmpl *template.Template, cfg *Config) {
